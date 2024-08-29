@@ -42,7 +42,7 @@ class TriangleAttentionStartingNode(torch.nn.Module):
         k = k.view(*q_shape, h, c_h)
         v = v.view(*q_shape, h, c_h)
         g = g.view(*q_shape, h, c_h)
-        b = b.view(*q_shape[:-2], 1, *q_shape[-2:], h)#.transpose(-2,-4).transpose(-2,-3)
+        b = b.view(*q_shape[:-2], 1, *q_shape[-2:], h)#.transpose(-2,-4).transpose(-2,-3)       # (B, 1, i, j , h)
 
         if q.dim() == 4:
             a = torch.einsum("i q h c, i v h c -> i q v h", q, k) / (c_h**0.5) # (B, i, r_q, r_v, h)

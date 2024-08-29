@@ -37,6 +37,8 @@ class EvoformerBlock(torch.nn.Module):
         # symmetry를 반영하기 위해서 triangular multiplicative update는 outgoing edge에 대해서 한 번, incoming edge에 대해서 한 번, 총 두 번 수행하게 된다.
         self.tri_mul_out = TriangleMultiplicationOutgoing(c_z)
         self.tri_mul_in = TriangleMultiplicationIncoming(c_z)
+
+        # 두 edge의 affinity를 query-key dot product로 계산하고, 삼각형을 완성하는 나머지 edge의 정보를 bias로 추가하여 해당 starting/ending node를 중심으로 하는 삼각형의 attention을 계산
         self.tri_attn_start = TriangleAttentionStartingNode(c_z, c_h_p, n_h_p)
         self.tri_attn_end = TriangleAttentionEndingNode(c_z, c_h_p, n_h_p)
         self.pair_transition = PairTransition(c_z, t_n)
@@ -45,8 +47,8 @@ class EvoformerBlock(torch.nn.Module):
         """
         Algorithm 6: Evoformer stack (Block)
 
-        m: (B, s, i, c)
-        z: (B, i, j, c)
+        m: (B, s, i, c), MSA representation
+        z: (B, i, j, c), pair representation
 
         return: [
             m: (B, s, i, c),

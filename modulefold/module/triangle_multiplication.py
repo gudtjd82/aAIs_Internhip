@@ -29,7 +29,7 @@ class TriangleMultiplicationOutgoing(torch.nn.Module):
 
         if pair_mask == None:
             pair_mask = z.new_ones(z.shape[:-1])
-        pair_mask = pair_mask.unsqueeze(-1)
+        pair_mask = pair_mask.unsqueeze(-1)     # (B< i, j, 1)
 
         z = self.layer_norm(z)
 
