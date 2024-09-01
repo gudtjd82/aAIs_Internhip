@@ -473,6 +473,8 @@ class StructureModuleTest(torch.nn.Module):
             self.lit_positions,
         )
 
+# IPA
+# 두 residue 사이의 attention을 3차원 공간에서 수행하되 3차원 공간 자체의 global transformation에는 invariant하고, 두 residue의 상대적인 거리가 변화할 때에만 attention이 변화할 수 있도록 하는 것이 목적이다.
 class InvariantPointAttention(torch.nn.Module):
     def __init__(self, c_s=384, c_z=128, c_ipa=16, n_head=12, n_qk_points=4, n_v_points=8, inf=1e5, eps=1e-12):
         super().__init__()
@@ -516,68 +518,89 @@ class InvariantPointAttention(torch.nn.Module):
         kv = kv.view(kv.shape[:-1] + (h, -1))
         k, v = torch.split(kv, c, dim=-1) # Fix c_h!
         q, k, v = q.view(*s_shape, h, c), k.view(*s_shape, h, c), v.view(*s_shape, h, c)
+        # -> (B, i, h, c)
 
         q_points, kv_points = self.query_points(s), self.kv_points(s)
+        # -> q_points: (B, i, 3 * q_points * h)
+        #    kv_points: (B, i, 3 * K)
         kv_points = torch.split(kv_points, kv_points.shape[-1] // 3, dim=-1)
+        # -> kv_points: [(B, i, K), (B, i, K), (B, i, K)]
         kv_points = torch.stack(kv_points, dim=-1)
+        # -> kv_points: (B, i, K, 3)
         kv_points = T[..., None].apply(kv_points)
 
         kv_points = kv_points.view(kv_points.shape[:-2] + (h, -1, 3))
+        # -> kv_points: (B, i, h, K', 3)
         k_points, v_points = torch.split(
             kv_points, [self.n_qk_points, self.n_v_points], dim=-2
         )
+        # -> k_points: (B, i , h, n_qk_points, 3)
+        #    v_points: (B, i , h, n_v_points, 3)
         
         # (B, i, h * q_points, 3), (B, i, h * k_points, 3), (B, i, h * v_points, 3)
 
         # (B, i, h, q_points, 3)
         q_points = torch.split(q_points, q_points.shape[-1] // 3, dim=-1)
+        # -> q_points: [(B, i, q_points * h), (B, i, q_points * h), (B, i, q_points * h)]
         q_points = torch.stack(q_points, dim=-1)
+        # -> q_points: (B, i, q_points * h, 3)
         q_points = T[..., None].apply(q_points).view(*s_shape, h, self.n_qk_points, 3)
+        # -> q_points: (B, i, h, q_points, 3)
 
+        # Single MSA representation을 이용한 standard self-attention
+        # + bias term(= Pair representation)
         if q.dim() == 3:
-            b = self.bias(z).permute(2, 0, 1) # (i, j, h)
+            b = self.bias(z).permute(2, 0, 1) # (i, j, h) -> (h, i, j)
         else:
-            b = self.bias(z).permute(0, 3, 1, 2) # (B, i, j, h) # fix here
+            b = self.bias(z).permute(0, 3, 1, 2) # (B, i, j, h) -> (B, h, i, j) # fix here
         
         if q.dim() == 3:
             a = q.permute(1, 0, 2) @ k.permute(1, 2, 0) * ((3*c) ** -0.5) + (3**-0.5)*b # (h, i, j)
+            #       (h, i, c)      @    (h, c, i)                         + (h, i, h)
+            # -> a: (h, i, j)
         else:
             a = q.permute(0, 2, 1, 3) @ k.permute(0, 2, 3, 1) * ((3*c) ** -0.5) + (3**-0.5)*b # (B, h, i, j)
+            #      (B, h, i, c)       @    (B, h, c, i)                         + (B, h, i, h)
+            # -> a: (B, h, i, j)
 
+        # 현재까지 예측된 3차원 상의 backbone frame 사이의 관계 (거리가 가까울수록 보다 많은 관계성을 부여)를 self-attention 상에 반영
         point_attention = torch.sum((q_points.unsqueeze(-4) - k_points.unsqueeze(-5)) ** 2, dim=-1) # (B, i, j, h, q_points)
-        if a.dim() == 3:
-            head_weights = self.softplus(self.gamma).view(1, 1, h) # (1, 1, h, 1)
-        else:
-            head_weights = self.softplus(self.gamma).view(1, 1, 1, h) # (1, 1, 1, h, 1)
+        #            sum((B, i, 1, h, q_points, 3) - (B, 1, i, h, q_points, 3)) -> (B, i, j, h, q_points)
+        if a.dim() == 3:    # a: (h, i, j)
+            head_weights = self.softplus(self.gamma).view(1, 1, h) # (1, 1, h)
+        else:   # a: (B, h, i, j)
+            head_weights = self.softplus(self.gamma).view(1, 1, 1, h) # (1, 1, 1, h)
         point_attention = torch.sum(point_attention, dim=-1) * (-0.5) # (B, i, j, h)
         point_attention *= head_weights * self.w_c * 3 ** (-0.5)
         
         if a.dim() == 3:
-            a += point_attention.permute(2, 0, 1) # (h, i, j)
+            a += point_attention.permute(2, 0, 1) # -> (h, i, j)
         else:
-            a += point_attention.permute(0, 3, 1, 2) # (B, h, i, j)
+            a += point_attention.permute(0, 3, 1, 2) # -> (B, h, i, j)
         # a *= self.w_L
         mask_bias = seq_mask.unsqueeze(-1) * seq_mask.unsqueeze(-2)
         mask_bias = 1e5 * (mask_bias-1)
         a = a + mask_bias
         a = torch.nn.functional.softmax(a, dim=-1) # (B, h, i, j)
 
+        # 2. self-attention of Single MSA representation 
         o = torch.matmul(
             a, v.transpose(-2, -3)
         ).transpose(-2, -3)
         o = o.reshape(*s_shape, h * c) # (B, i, h * c)
 
-
-        if v_points.dim() == 4:
+        # 3. self-attention of 현재까지 예측된 3차원 상의 backbone frame 사이의 관계
+        if v_points.dim() == 4: # v_points: (i , h, n_v_points, 3)
             v_points = v_points.permute(1, 3, 0, 2) # (h, 3, i, v_points)
-        else:
+        else:                   # v_points: (B, i , h, n_v_points, 3)
             v_points = v_points.permute(0, 2, 4, 1, 3) # (B, h, 3, i, v_points)
         o_points = torch.sum(a[..., None, :, :, None] * v_points[..., None, :, :], dim=-2)
-        # (B, h, 3, i, v_points)
+        #                     (B, h, 1, i, j, 1) * (B, h, 3, 1, i, v_points)
+        # -> o_points: (B, h, 3, i, v_points)
 
-        if o_points.dim() == 4:
+        if o_points.dim() == 4: # o_points: (h, 3, i, v_points)
             o_points = o_points.permute(2, 0, 3, 1) # (i, h, v_points, 3)
-        else:
+        else:   # o_points: (B, h, 3, i, v_points)
             o_points = o_points.permute(0, 3, 1, 4, 2) # (B, i, h, v_points, 3)
         o_points = T[..., None, None].invert_apply(o_points)
 
@@ -585,9 +608,11 @@ class InvariantPointAttention(torch.nn.Module):
         o_points_norm = torch.clamp(o_points_norm, min=1e-6).view(*s_shape, h * self.n_v_points) # (B, i, h * v_points)
         o_points = o_points.reshape(*s_shape, h * self.n_v_points, 3) # (B, i, h * v_points, 3)
 
+        # 1. self-attention of Pair representation
         o_pair = a.transpose(-2, -3) @ z # (B, i, h, j) @ (B, i, j, c) -> (B, i, h, c)
-        o_pair = o_pair.view(*s_shape, h * self.n_v_points * c) # (B, i, h * h * c)
+        o_pair = o_pair.view(*s_shape, h * self.n_v_points * c) # (B, i, h * v_points * c)
 
         s = self.linear_out(torch.cat([o, *torch.unbind(o_points, dim=-1), o_points_norm, o_pair], dim=-1)) # (B, i, c)
+        # torch.unbind(o_points, dim=-1): [(B, i, h * v_points), (B, i, h * v_points), (B, i, h * v_points)], 3D coordinates
 
         return s
